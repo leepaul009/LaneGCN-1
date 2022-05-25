@@ -19,6 +19,7 @@ from layers import Conv1d, Res1d, Linear, LinearRes, Null
 from numpy import float64, ndarray
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 import copy
+from torch import linalg as linalg
 
 file_path = os.path.abspath(__file__)
 root_path = os.path.dirname(file_path)
@@ -34,16 +35,12 @@ config["epoch"] = 0
 config["horovod"] = True
 config["opt"] = "adam"
 config["num_epochs"] = 36
-config["lr"] = [1e-3, 1e-4]
+config["lr"] = [1e-3, 1e-4] #  [0.0005, 0.00005]
 config["lr_epochs"] = [32]
 config["lr_func"] = StepLR(config["lr"], config["lr_epochs"])
 
-
 if "save_dir" not in config:
-    config["save_dir"] = os.path.join(
-        root_path, "results", model_name
-    )
-
+    config["save_dir"] = os.path.join(root_path, "results", model_name)
 if not os.path.isabs(config["save_dir"]):
     config["save_dir"] = os.path.join(root_path, "results", config["save_dir"])
 
@@ -52,26 +49,16 @@ config["val_batch_size"] = 12
 config["workers"] = 0
 config["val_workers"] = config["workers"]
 
-
 """Dataset"""
 # Raw Dataset
-config["train_split"] = os.path.join(
-    root_path, "dataset/train/data"
-)
+config["train_split"] = os.path.join(root_path, "dataset/train/data")
 config["val_split"] = os.path.join(root_path, "dataset/val/data")
 config["test_split"] = os.path.join(root_path, "dataset/test_obs/data")
-
 # Preprocessed Dataset
 config["preprocess"] = True # whether use preprocess or not
-config["preprocess_train"] = os.path.join(
-    root_path, "dataset","preprocess", "train_crs_dist6_angle90.p"
-)
-config["preprocess_val"] = os.path.join(
-    root_path,"dataset", "preprocess", "val_crs_dist6_angle90.p"
-)
-config['preprocess_test'] = os.path.join(
-    root_path, "dataset",'preprocess', 'test_test.p')
-
+config["preprocess_train"] = os.path.join(root_path, "dataset","preprocess", "train_crs_dist6_angle90.p")
+config["preprocess_val"]   = os.path.join(root_path,"dataset", "preprocess", "val_crs_dist6_angle90.p")
+config['preprocess_test']  = os.path.join(root_path, "dataset",'preprocess', 'test_test.p')
 """Model"""
 config["rot_aug"] = False
 config["pred_range"] = [-100.0, 100.0, -100.0, 100.0]
@@ -136,17 +123,19 @@ def subgraph_gather(subgraphs_in_batch):
     num_atgs_per_batch = []
     spans = []
     start = 0
-    for batch_idx in range(batch_size):
-        subgraphs = subgraphs_in_batch[batch_idx]
-        num_atgs  = len(subgraphs)
+    agt_vels = []
+    for batch_i in range(batch_size):
+        # subgraphs = subgraphs_in_batch[batch_i]
+        num_atgs  = len(subgraphs_in_batch[batch_i])
         num_atgs_per_batch.append(num_atgs)
         num_nodes_this_batch = 0
         for atg_i in range(num_atgs):
             counts_per_agt.append(count)
-            num_nodes = len( subgraphs[atg_i]['feats'] )
+            num_nodes = len( subgraphs_in_batch[batch_i][atg_i]['feats'] )
             idcs = torch.arange(count, count + num_nodes).to(
-                subgraphs[atg_i]['feats'].device
+                subgraphs_in_batch[batch_i][atg_i]['feats'].device
             )
+            agt_vels.append(subgraphs_in_batch[batch_i][atg_i]['agent_vel'])
             node_idcs.append(idcs)
             count += num_nodes
             num_nodes_this_batch += num_nodes
@@ -167,10 +156,9 @@ def subgraph_gather(subgraphs_in_batch):
     feats, agt_feat, rel_a2m_us, rel_a2m_vs = [], [], [], []
     for batch_i in range(batch_size):
         temp, agt_temp = [], []
-        for atg_i in range(num_atgs_per_batch[batch_i]): # merge along agents
-            # n_nodes = len(subgraphs_in_batch[batch_i][atg_i]["feats"])
-            temp.append( subgraphs_in_batch[batch_i][atg_i]["feats"] )
-            agt_temp.append( subgraphs_in_batch[batch_i][atg_i]["agent_feat"].view(1, -1) )
+        for atg_i in range(num_atgs_per_batch[batch_i]):
+            temp.append( subgraphs_in_batch[batch_i][atg_i]["feats"] ) # [nodes, map_dim]
+            agt_temp.append( subgraphs_in_batch[batch_i][atg_i]["agent_feat"].view(1, -1) ) # [1, agt_dim]
 
             us = subgraphs_in_batch[batch_i][atg_i]['a2m']['u'] + idx_roi
             vs = subgraphs_in_batch[batch_i][atg_i]['a2m']['v'] + counts_per_agt[idx_roi]
@@ -179,6 +167,8 @@ def subgraph_gather(subgraphs_in_batch):
             idx_roi += 1
 
         # merge laneRoi with a batch
+        assert len(temp) > 0, "batch {} have empty subgraphs".format(batch_i)
+        
         temp = torch.cat(temp, 0)
         agt_temp = torch.cat(agt_temp, 0)
         feats.append(temp)
@@ -186,9 +176,11 @@ def subgraph_gather(subgraphs_in_batch):
     graph["feats"] = feats # list of tensor, size=batch_size
     graph["agent_feat"] = agt_feat # list of tensor, size=batch_size
     graph["ctrs"]  = [feats[i][:, :2] for i in range(batch_size)]
+    graph["dirs"]  = [feats[i][:, 2:4] for i in range(batch_size)]
     graph["pose"]  = [feats[i][:, :4] for i in range(batch_size)]
+    graph["agent_vel"] = agt_vels
     graph["a2m"] = {"u": torch.cat(rel_a2m_us, 0), "v": torch.cat(rel_a2m_vs, 0)}
-    # graph["a2m"] = to_long(graph["a2m"])
+
     ## merge edge
     for k1 in ["pre", "suc"]:
         graph[k1] = []
@@ -281,40 +273,71 @@ class LaneInput(nn.Module):
         map_dim = config["n_map"]
         norm = "GN"
         ng = 1
-        self.map_fc = nn.Sequential(
-            nn.Linear(8, map_dim),
-            nn.ReLU(inplace=True),
-            Linear(map_dim, map_dim, norm=norm, ng=ng)
-        )
-#         self.agt_fc = nn.Sequential(
-#             nn.Linear(80, map_dim),
-#             nn.ReLU(inplace=True),
-#             Linear(map_dim, map_dim, norm=norm, ng=ng, act=False)
+        
+#         self.map_input = nn.Sequential(
+#             # nn.Linear(8, map_dim),
+#             # nn.ReLU(inplace=True),
+#             Linear(map_dim, map_dim, norm=norm, ng=ng),
+#             # nn.Linear(map_dim, map_dim, bias=False),
 #         )
+#         self.agt_input = nn.Sequential(
+#             # nn.Linear(80, map_dim),
+#             # nn.ReLU(inplace=True),
+#             Linear(map_dim, map_dim, norm=norm, ng=ng),
+#             # nn.Linear(map_dim, map_dim, bias=False),
+#         )
+        # self.map_input = Linear(8, map_dim, norm=norm, ng=ng)
+        # self.agt_input = Linear(80, map_dim, norm=norm, ng=ng)
+        
+        self.map_fc = nn.Linear(8, map_dim, bias=False)
         self.agt_fc = nn.Linear(80, map_dim, bias=False)
-    
-        self.fc = Linear(2*map_dim, map_dim, norm=norm, ng=ng)
+        # self.fc = Linear(2*map_dim, map_dim, norm=norm, ng=ng, act=False)
+        # self.fc = Linear(map_dim, map_dim, norm=norm, ng=ng, act=False)
         self.bn = nn.GroupNorm(gcd(ng, map_dim), map_dim)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, graph):
-        map_feats = torch.cat(graph["feats"], 0) # [nodes, 8]
+        map_feats = torch.cat(graph["feats"], 0)      # [nodes, 8]
         agt_feats = torch.cat(graph["agent_feat"], 0) # [agts, 80]
 
-        map_feats = self.map_fc(map_feats) # [nodes, 128], fc+relu+fc+norm+relu
+        # map_feats = self.map_input(map_feats) # [nodes, 128], fc+relu+(fc+gn+relu)
+        # agt_feats = self.agt_input(agt_feats) # [agts, 128]
+        
+        # res = map_feats
 
-        tmp_feats = torch.zeros_like(map_feats) # [nodes, 128]
-        tmp_feats.index_add(
+        # tmp_feats = torch.zeros(map_feats.shape, dtype=map_feats.dtype, device=map_feats.device)
+        map_feats = self.map_fc(map_feats)
+        map_feats.index_add_(
+            0, graph["a2m"]["v"],
+            self.agt_fc( agt_feats[ graph["a2m"]["u"] ] ), # fc
+        )
+        map_feats = self.bn(map_feats)
+        map_feats = self.relu(map_feats)
+        
+        '''
+        map_feats.index_add_(
+            0, 
+            graph["a2m"]["v"],
+            agt_feats[ graph["a2m"]["u"] ])
+        map_feats = self.bn(map_feats)
+        map_feats = self.relu(map_feats)
+        '''
+        
+        '''
+        map_feats.index_add_(
             0,
             graph["a2m"]["v"],
             self.agt_fc( agt_feats[ graph["a2m"]["u"] ] ), # fc
         )
-        tmp_feats = self.bn(tmp_feats)
-        tmp_feats = self.relu(tmp_feats)
+        map_feats = self.bn(map_feats)
+        map_feats = self.relu(map_feats)
+        '''
         
-        map_feats = torch.cat([map_feats, tmp_feats], -1)
-        
-        map_feats = self.fc(map_feats) # fc+norm+relu
+        # map_feats = torch.cat([map_feats, tmp_feats], -1)
+        # map_feats = self.fc(map_feats)
+        # map_feats += res
+        # map_feats = self.relu(map_feats)
+
         return map_feats
 
 
@@ -427,7 +450,7 @@ class LanePooling(nn.Module):
     ## input:
     ##  context_feat: roi_lane feature
     ##  target_feat:  g_graph feature
-    def forward(self, context_feat, context_graph, target_feat, target_graph, dist_th=2.0, g2r=False):
+    def forward(self, context_feat, context_graph, target_feat, target_graph, dist_th=6.0, g2r=False):
         # list[tensor] per batch
         context_ctrs_batch, target_ctrs_batch = context_graph['ctrs'], target_graph['ctrs']
         # tensor merged along batch
@@ -465,19 +488,16 @@ class LanePooling(nn.Module):
         ctx = torch.cat([context_feat[hi], dist_feat], -1) # [n_rel, 128 + 128]
         ctx = self.ctx(ctx) # M_a: fc + norm + relu + fc
         
-        # if g2r:
         identity = target_feat
         # do not add this step will make input be changed
         # otherwise bp update target_feat that is also input of another network
         target_feat = self.input(target_feat) # fc
-        
         
         target_feat.index_add_(0, wi, ctx) # add context feature to target feature
         target_feat = self.norm(target_feat)
         target_feat = self.relu(target_feat)
 
         target_feat = self.mlp(target_feat) # M_b: fc + relu + fc + norm
-        # if g2r:
         target_feat += identity
         target_feat = self.relu(target_feat)
 
@@ -592,33 +612,23 @@ class Interactor(nn.Module):
             Linear(n_map, n_map, norm=norm, ng=ng, act=False),
         )
         self.relu = nn.ReLU(inplace=True)
-
+        
         self.roi2graph        = LanePooling(in_dim=128, out_dim=128)
         self.global_graph_net = GlobalGraphNet(config)
         self.graph2roi        = LanePooling(in_dim=128, out_dim=128)
 
     def forward(self, graph, subgraph, roi_feat):
-        
         ## graph input -> graph feat
-        '''
         ctrs = torch.cat(graph["ctrs"], 0)
-        graph_feat = self.input(ctrs)           # [g_nodes, 2] -> [g_nodes, 128]
-        graph_feat += self.seg(graph["feats"])  # [g_nodes, 2] -> [g_nodes, 128]
-        graph_feat = self.relu(graph_feat)
-        '''
+        graph_input =  self.input(ctrs)           # [g_nodes, 2] -> [g_nodes, 128]
+        graph_input += self.seg(graph["feats"])  # [g_nodes, 2] -> [g_nodes, 128]
+        graph_input =  self.relu(graph_input)
         
-        # if True:
-        graph_feat = torch.zeros(( len(graph['feats']), 128 ), dtype=torch.float, device=roi_feat.device)
-        
-        ## lane pooling: roi feat -> graph feat
-        graph_feat = self.roi2graph(roi_feat, subgraph, graph_feat, graph, g2r=False)
+        # graph_input = torch.zeros(( len(graph['feats']), 128 ), dtype=torch.float, device=roi_feat.device)
 
-        ## map net: graph feat -> graph feat
-        graph_feat = self.global_graph_net(graph_feat, graph)
-        
-        ## lane pooling: graph feat -> roi feat
-        roi_feat = self.graph2roi(graph_feat, graph, roi_feat, subgraph, g2r=True)
-
+        graph_feat = self.roi2graph(roi_feat, subgraph, graph_input, graph) # lane pooling: roi feat -> graph feat
+        graph_feat = self.global_graph_net(graph_feat, graph) # map net: graph feat -> graph feat
+        roi_feat   = self.graph2roi(graph_feat, graph, roi_feat, subgraph) # lane pooling: graph feat -> roi feat
         return roi_feat
 
 
@@ -646,7 +656,7 @@ class PredHead(nn.Module):
 class RoiLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
+        self.config   = config
         self.num_mods = config["num_mods"] # 6
         self.bce_loss = nn.BCELoss()
         self.reg_loss = nn.SmoothL1Loss(reduction="sum")
@@ -666,95 +676,89 @@ class RoiLoss(nn.Module):
         valid_agent_ids = to_long(gpu(data['valid_agent_ids']))
         gt_preds  = [x[ids].view(-1,30,2) for ids, x in zip( valid_agent_ids, gt_preds )]
         has_preds = [x[ids].view(-1,30)   for ids, x in zip( valid_agent_ids, has_preds )]
+        gt_preds  = torch.cat(gt_preds, 0)
+        has_preds = torch.cat(has_preds, 0)
+
         agt_ctrs  = [x[ids].view(-1,2)    for ids, x in zip( valid_agent_ids, gpu(data['ctrs']) )]
         agt_dirs  = [x[ids].view(-1,20,3) for ids, x in zip( valid_agent_ids, gpu(data['feats']) )]
         # NAs : num of agents (sum along batch)
-        agt_ctrs  = torch.cat(agt_ctrs, 0)  # [NAs, 2]
+        agt_ctrs  = torch.cat(agt_ctrs, 0) # [NAs, 2]
         agt_dirs  = torch.cat(agt_dirs, 0) # [NAs, 20, 3]
-        agt_poses = torch.cat([agt_ctrs, agt_dirs[:, -1, :2]], -1) # [NAs, 4]
-        # agt_vel      = torch.sqrt(( agt_dirs[:, -1, :2]**2 ).sum(-1)) / 0.1
-        # agt_gt_preds = torch.cat(data['gt_preds'], 0).to(device)
-        # agt_s        = agt_gt_preds[:, 1:] - agt_gt_preds[:, :-1]
-        # agt_s        = torch.sum( torch.sqrt((agt_s**2).sum(-1)), -1)
-        # agt_acc      = 2 * (agt_s - agt_vel * 3) / 9
-
-        ## to local coordinate
-        # rots, origs = gpu(data["rot"]), gpu(data["orig"])
-        # for batch_i in range(batch_size):
-        #     orig, rot = origs[batch_i], rots[batch_i]
-        #     gt_preds[batch_i] = torch.matmul( (gt_preds[batch_i] - orig.view(1, 1, -1)), rot.transpose(1, 0) )
-        
-        gt_preds  = torch.cat(gt_preds, 0)
-        has_preds = torch.cat(has_preds, 0)
-        # gt_preds_orig  = copy.deepcopy(gt_preds)  # [NAs, 30, 2]
-        # has_preds_orig = copy.deepcopy(has_preds) # [NAs, 30]
-        # gt_preds  = gt_preds.unsqueeze(1).repeat(1, num_mods, 1, 1) # [NAs, 6, 30, 2]
-        # has_preds = has_preds.unsqueeze(1).repeat(1, num_mods, 1)   # [NAs, 6, 30]
+        agt_fdir  = agt_dirs[:, -1, :2] # [NAs, 2]
+        norm_dist = linalg.norm(agt_fdir, dim=1) # [NAs,]
+        norm_fdir = agt_fdir / norm_dist.view(-1, 1) # [NAs, 2] / [NAs, 1]
+        norm_fdir[norm_dist < 1e-6] = 0.
+        agt_normal_vels = torch.tensor(subgraph["agent_vel"], dtype=norm_fdir.dtype, device=device) # [NAs,]
+        agt_vels = norm_fdir * agt_normal_vels.view(-1, 1) # [NAs, 2] * [NAs, 1]
 
 
         loss_out = dict()
-        anchors  = torch.cat(subgraph["pose"], 0)
-        preds_list, logics_list  = [], []
-        stage_one_loss, num_stage_one = 0, 0
-        for agt_i, span in enumerate(subgraph["agt_spans"]): # per agent(or lane_roi) = NAs
-            anchor  = anchors[span[0] : span[1]] # [nodes_per_roi, 4]
+        anchor_ctrs = torch.cat(subgraph["ctrs"], 0)
+        anchor_dirs = torch.cat(subgraph["dirs"], 0)
+
+        pred_goals_per_agt, pred_theta_per_agt, pred_logics_per_agt  = [], [], []
+        stage_one_loss, num_stage_one = 0., 0
+
+        for agt_i, span in enumerate(subgraph["agt_spans"]): # per laneRoi = NAs
+            ### get anchor
+            anc_ctrs = anchor_ctrs[span[0] : span[1]] # [nodes_per_roi, 2]
+            anc_dirs = anchor_dirs[span[0] : span[1]] # [nodes_per_roi, 2]
+            anc_theta = torch.atan2(anc_dirs[:, 1], anc_dirs[:, 0]) 
+            ### generate prediction
             pred    = preds[span[0] : span[1]]   # [nodes_per_roi, 5]
             logics  = pred[:, 0]  # [nodes_per_roi,]
-            poses   = pred[:, 1:] # [nodes_per_roi, 4]
+            pred_delta_xy    = pred[:, 1:3] # [nodes_per_roi, 2]
+            pred_delta_theta = torch.atan(pred[:, 3] / pred[:, 4]) # [nodes_per_roi,]
+            
+            pred_xy = anc_ctrs + pred_delta_xy # [nodes_per_roi, 2]
+            pred_theta = anc_theta + pred_delta_theta # [nodes_per_roi,]
 
-            pred_goals = anchor + poses
-            
-            # dist = anchor[:, :2] - gt_preds[agt_i, -1].reshape(1,-1) #  [nodes_per_roi, 2] - [1,2]
-            # dist = torch.sqrt(dist**2).sum(-1) # [nodes_per_roi,]
-            # matched_node_id = torch.argmin(dist).reshape(1) # get best matched node
-            # stage_one_loss += F.nll_loss(logics.unsqueeze(0), matched_node_id)
-            # num_stage_one  += 1
-            
-            # _, sorted_logic_indices = logics.sort()
-            # sorted_dist, sorted_dist_indices = dist.sort() # [nodes_per_roi,]
-            
-            x1y1  = pred_goals[:,:2] - 0.25 # self.config["cls_th"]
-            x2y2  = pred_goals[:,:2] + 0.25 # self.config["cls_th"]
-            boxes = torch.cat([x1y1, x2y2], -1)
-            idxs  = torchvision.ops.nms(boxes, logics, iou_threshold=0.5)
-            
-            if True and len(idxs) < num_mods:
-                idxs = torch.arange(len(boxes))
-            
-            dist = pred_goals[idxs,:2] - gt_preds[agt_i, -1].reshape(1,-1) # [nms, 2] - [1,2]
+            ### select proposals with NMS
+            # x1y1, x2y2 = pred_xy - 0.25, pred_xy + 0.25
+            # boxes = torch.cat([x1y1, x2y2], -1)
+            # nms_idcs  = torchvision.ops.nms(boxes, logics, iou_threshold=0.5)
+            # if True and len(nms_idcs) < num_mods:
+            #     nms_idcs = torch.arange(len(boxes))
+            nms_idcs = torch.arange(len(pred_xy))
+
+            dist = pred_xy[nms_idcs] - gt_preds[agt_i, -1].reshape(1,-1) # [nms, 2] - [1,2]
             dist = torch.sqrt(dist**2).sum(-1) # [nms,]
-            min_idx = torch.argmin(dist).reshape(1)
+            _, sort_indices = dist.sort()
+            min_idx = sort_indices[0] # get min index from nms sequence
             
-            scores = logics[idxs]
+            ### calculate loss for stage 1
+            scores = logics[nms_idcs]
             scores = F.log_softmax(scores, dim=-1)
-            stage_one_loss += F.nll_loss(scores.unsqueeze(0), min_idx)
+            stage_one_loss += F.nll_loss(scores.unsqueeze(0), min_idx.reshape(1))
             num_stage_one  += 1
             
-            _, sort_indices = dist.sort() # [nms,]
-            sort_indices = idxs[sort_indices]
-            
-            top_k_ind = sort_indices[:num_mods]
-            logics_list.append(logics[top_k_ind])
-            preds_list.append(pred_goals[top_k_ind])
-
+            top_k_idcs = nms_idcs[sort_indices]
+            top_k_idcs = top_k_idcs[:num_mods]
+            pred_logics_per_agt.append(logics[top_k_idcs])
+            pred_goals_per_agt.append(pred_xy[top_k_idcs])
+            pred_theta_per_agt.append(pred_theta[top_k_idcs])
         loss_out["stage_one_loss"] = 0 # 0 if num_stage_one == 0 else stage_one_loss / (num_stage_one + 1e-10)
-        
-        
+         
         ## here preds are not good
-        preds  = torch.cat([x.unsqueeze(0) for x in preds_list], 0)    # [NAs, 6, 4] goal x/y/dx/dy
-        logics = torch.cat([x.reshape(1, -1) for x in logics_list], 0) # [NAs, 6]
-        # print(" preds: {}".format(preds))
+        pred_ctrs   = torch.cat([x.unsqueeze(0) for x in pred_goals_per_agt], 0)  # [NAs, 6, 2] predicted goal x/y
+        pred_thetas = torch.cat([x.unsqueeze(0) for x in pred_theta_per_agt], 0) # [NAs, 6]
+        pred_dists  = torch.sqrt( ((pred_ctrs - agt_ctrs.view(-1, 1, 2))**2).sum(-1) ) # [NAs, 6]
+        pred_vels   = 2 * (pred_dists - agt_normal_vels.view(-1, 1) * 3.0) / 9.0 # [NAs, 6]
+        # [NAs, 6] => [NAs, 6, 2]
+        pred_norm_vec = torch.cat([torch.cos(pred_thetas).view(-1, num_mods, 1), torch.sin(pred_thetas).view(-1, num_mods, 1)], -1)
+        pred_vels = pred_vels.view(-1, num_mods, 1) * pred_norm_vec # [NAs, 6, 2]
+        logics    = torch.cat([x.reshape(1, -1) for x in pred_logics_per_agt], 0) # [NAs, 6]
 
-        ## a1 = (2 * x_t * dx_0 + 2 * x_0 * dx_0) / (2 + dx_0 - dx_t); a0 = x_t - x_0 - a1;  a2 = x_0 
-        preds     = preds.view(-1, 6, 4)     # [NAs, 6, 4], goal x4, [x_t y_t dx_t dy_t]
-        agt_poses = agt_poses.view(-1, 1, 4) # [NAs, 1, 4], pose x4, [x_0 y_0 dx_0 dy_0]
+        ## a1 = (2 * x_t * dx_0 + 2 * x_0 * dx_0) / (2 + dx_0 - dx_t); a0 = x_t - x_0 - a1;  a2 = x_0
+        agt_ctrs = agt_ctrs.view(-1, 1, 2)
+        agt_vels = agt_vels.view(-1, 1, 2)
         ## compute coeff, a0,a1,a2: [NAs, 6]
-        a1 = (2 * preds[:,:, 0] * agt_poses[:,:, 2] + 2 * agt_poses[:,:, 0] * agt_poses[:,:, 2]) / (2 + agt_poses[:,:, 2] - preds[:,:, 2])
-        a0 = preds[:,:, 0] - agt_poses[:,:, 0] - a1
-        a2 = agt_poses[:,:, 0].repeat(1, 6)
-        b1 = (2 * preds[:,:, 1] * agt_poses[:,:, 3] + 2 * agt_poses[:,:, 1] * agt_poses[:,:, 3]) / (2 + agt_poses[:,:, 3] - preds[:,:, 3])
-        b0 = preds[:,:, 1] - agt_poses[:,:, 1] - b1
-        b2 = agt_poses[:,:, 1].repeat(1, 6)
+        a1 = (2 * pred_ctrs[:,:,0] * agt_vels[:,:,0] + 2 * agt_ctrs[:,:,0] * agt_vels[:,:,0]) / (2 + agt_vels[:,:,0] - pred_vels[:,:,0])
+        a0 = pred_ctrs[:,:,0] - agt_ctrs[:,:,0] - a1
+        a2 = agt_ctrs[:,:,0].repeat(1, 6)
+        b1 = (2 * pred_ctrs[:,:,1] * agt_vels[:,:,1] + 2 * agt_ctrs[:,:,1] * agt_vels[:,:,1]) / (2 + agt_vels[:,:,1] - pred_vels[:,:,1])
+        b0 = pred_ctrs[:,:,1] - agt_ctrs[:,:,1] - b1
+        b2 = agt_ctrs[:,:,1].repeat(1, 6)
 
         s_samples  = (1.0/29) * torch.arange(0, 30) # [30], sample=0~1, 30 step.
         s_samples  = gpu(s_samples)
@@ -792,28 +796,10 @@ class RoiLoss(nn.Module):
         # compute dist between each mode(pred goal point) and gt(last valid point) 
         dist = torch.cat([x.unsqueeze(1) for x in dist_per_mode], 1) # [VAs, 6]
         # get mode id with smallest dist to gt
-        min_dist, min_idcs = dist.min(-1) # [VAs,]
-        '''
-        # get each agent's logic diff between modes and best mode, [VAs, 1] - [VAs, 6] = [VAs, 6]
-        mgn = masked_logics[row_idcs, min_idcs].unsqueeze(1) - masked_logics
-        # get agent whose best_mode_dist smaller than cls_th
-        mask_close = (min_dist < self.config["cls_th"]).view(-1, 1) # [VAs, 1] cls_th = 2.0
-        # for each agent, ignore the modes which is similar to best_mode
-        mask_significant = dist - min_dist.view(-1, 1) > self.config["cls_ignore"] # [VAs, 6]
-        mgn = mgn[mask_close * mask_significant]
+        _, min_idcs = dist.min(-1) # [VAs,]
 
-        mask = mgn < self.config["mgn"] # 0.2
-        coef = self.config["cls_coef"]
-        loss_out["cls_loss"] = coef * (
-            self.config["mgn"] * mask.sum() - mgn[mask].sum()
-        )
-        loss_out["num_cls"]  = mask.sum().item()
-        '''
         
         #### BCE loss
-        # final_logics = masked_logics[row_idcs, min_idcs]
-        # self.sigmoid = nn.Sigmoid()
-        # masked_logics = self.sigmoid(masked_logics) # [VAs, 6]
         logic_gt = torch.zeros_like(masked_logics) # [VAs, 6]
         logic_gt[row_idcs, min_idcs] = 1
         
@@ -822,35 +808,20 @@ class RoiLoss(nn.Module):
             logic_gt.to(torch.float32),
             reduction="sum",
         )
-        # loss_out["cls_loss"] = self.bce_loss(masked_logics, logic_gt)
         loss_out["num_cls"] = len(masked_logics)
-        
+        del logic_gt
 
         #### regression
         temp = [0]
         temp.extend(subgraph["num_atgs_per_batch"][:-1])
         loss_out["traj_to_eval"] = [pred_trajs[i] for i in temp] # [6, 30, 2]
-        
-        # masked_preds     = pred_trajs[mask] # [VAs, 6, 30, 2]
-        # masked_gt_preds  = gt_preds[mask]  # [VAs, 30, 2]
-        
+
         gt_preds   = masked_gt_preds[masked_has_preds]
         pred_trajs = masked_preds[row_idcs, min_idcs] # [VAs, 30, 2]
         pred_trajs = pred_trajs[masked_has_preds]
-        
         coef = self.config["reg_coef"]
         loss_out["reg_loss"] = coef * self.reg_loss(pred_trajs, gt_preds)
         loss_out["num_reg"]  = masked_has_preds.sum().item()
-        
-        if False:
-            gt_preds   = gt_preds.unsqueeze(1).repeat(1, num_mods, 1, 1) # [NAs, 6, 30, 2]
-            has_preds  = has_preds.unsqueeze(1).repeat(1, num_mods, 1)   # [NAs, 6, 30]
-            gt_preds   = gt_preds[has_preds]
-            pred_trajs = pred_trajs[has_preds]
-
-            coef = self.config["reg_coef"]
-            loss_out["reg_loss"] = coef * self.reg_loss(pred_trajs, gt_preds)
-            loss_out["num_reg"]  = has_preds.sum().item()
 
         return loss_out
 
@@ -887,14 +858,11 @@ class PostProcess(nn.Module):
         post_out = dict()
         # post_out["preds"]     = [x[0:1].detach().cpu().numpy() for x in out["reg"]]
         post_out["preds"]     = [x.detach().cpu().numpy().reshape(1,6,30,2) for x in loss_out["traj_to_eval"]] # [1,6,30,2]
-        
         # gt_preds = data["gt_preds"]
         # rots, origs = data["rot"], data["orig"]
         # for batch_i in range(len(gt_preds)):
         #     orig, rot = origs[batch_i], rots[batch_i]
         #     gt_preds[batch_i] = torch.matmul( (gt_preds[batch_i] - orig.view(1, 1, -1)), rot.transpose(1, 0) )
-        
-        
         # post_out["gt_preds"]  = [x[0:1].numpy() for x in gt_preds]  # [1,30,2]
         post_out["gt_preds"]  = [x[0:1].numpy() for x in data["gt_preds"]]  # [1,30,2]
         post_out["has_preds"] = [x[0:1].numpy() for x in data["has_preds"]] # [1,30]
@@ -936,9 +904,9 @@ class PostProcess(nn.Module):
 
         cls = metrics["cls_loss"] / (metrics["num_cls"] + 1e-10)
         reg = metrics["reg_loss"] / (metrics["num_reg"] + 1e-10)
-        loss = cls + reg
-        print("reg_loss: {:.4f}, num_reg: {}".format(metrics["reg_loss"], metrics["num_reg"]))
         stg1_cls = metrics["stage_one_loss"]
+        loss = cls + reg + stg1_cls
+        # print("reg_loss: {:.4f}, num_reg: {}".format(metrics["reg_loss"], metrics["num_reg"]))
         # print("traj: {}".format(metrics["traj_to_eval"]))
 
         preds = np.concatenate(metrics["preds"], 0) # [N,6,30,2]
@@ -985,3 +953,16 @@ def get_model():
 
 
     return config, ArgoDataset, collate_fn, net, loss, post_process, opt
+
+def get_model_for_torch_dist():
+    net = Net(config)
+    net = net.cuda()
+
+    loss = Loss(config).cuda()
+    post_process = PostProcess(config).cuda()
+
+    # params = net.parameters()
+    # opt = Optimizer(params, config)
+
+
+    return config, ArgoDataset, collate_fn, net, loss, post_process, # opt
