@@ -62,10 +62,11 @@ class ArgoDataset(Dataset):
                 data = new_data
             else:
                 new_data = dict()
-                for key in ['city', 'orig', 'gt_preds', 'has_preds', 'theta', 'rot', 'feats','obs_trajs', 'ctrs', 'graph', 'subgraphs']:
+                for key in ['city', 'orig', 'gt_preds', 'has_preds', 'theta', 'rot', 'feats','obs_trajs', 'ctrs', 'graph']:
                     if key in data:
                         new_data[key] = ref_copy(data[key])
-                data = process_lane_roi(new_data)
+                        # new_data[key] = data[key]
+                data = generate_lane_roi(new_data)
            
             if 'raster' in self.config and self.config['raster']:
                 data.pop('graph')
@@ -684,8 +685,9 @@ def get_velocity_per_agent(agent_feats : np.ndarray, cycle_time=0.1):
 
 
 # AGs: agents, GNs: graph nodes
-# max_vel_threshold: 10 kph / 3.6 = 2.78 m/s
-def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
+# input:
+#   max_vel_threshold: 10 kph / 3.6 = 2.78 m/s
+def generate_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
     obs_steps   = data['feats'].shape[1] # 20
     agent_feats = data['feats']     # [AGs, seq=20, feat=3]
     agent_ctrs  = data['ctrs']      # [AGs, 2]
@@ -700,7 +702,19 @@ def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
     ## get distance between map node and agent, shape=[Gs, AGs, 2]
     dist = np.expand_dims(graph['ctrs'], axis=1) - np.expand_dims(agent_ctrs, axis=0)
     dist = np.sqrt((dist**2).sum(-1))
-    match_node_id_per_agent = dist.argmin(axis=0) # matched graph node id per agent
+    sorted_nodes_idcs = dist.argsort(axis=0) # [Gs, AGs]
+    
+    '''
+    sorted_node_dirs  = graph['feats'][sorted_nodes_idcs] # [Gs, AGs, 2]
+    t1 = np.arctan2(agent_feats[:, -1, 1], agent_feats[:, -1, 0]).reshape(1, -1) # [1, AGs]
+    t2 = np.arctan2(sorted_node_dirs[:, :, 1], sorted_node_dirs[:, :, 0]) # [Gs, AGs]
+    dt = np.abs(t1 - t2)
+    mask = dt > np.pi
+    dt[mask] = np.abs(dt[mask] - 2 * np.pi)
+    mask = dt < 0.25 * np.pi
+    match_node_id_per_agent = [ sorted_nodes_idcs[mask[:,i], i][0] for i in range(num_agents) ]
+    '''
+
     ## get interest nodes(<= 5.0) per agent
     closed_node_ids, closed_agent_ids = np.nonzero(dist < 5.0)
     assert len(gt_preds) == num_agents
@@ -714,10 +728,14 @@ def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
             pre[ graph['pre_pairs'][:, 0], graph['pre_pairs'][:, 1] ] = 1
         if len(graph['suc_pairs']) > 0:
             suc[ graph['suc_pairs'][:, 0], graph['suc_pairs'][:, 1] ] = 1
-        if len(graph['left_pairs']) > 0:
-            left[ graph['left_pairs'][:, 0], graph['left_pairs'][:, 1] ] = 1
-        if len(graph['right_pairs']) > 0:
-            right[ graph['right_pairs'][:, 0], graph['right_pairs'][:, 1] ] = 1
+        if len(graph['left']['u']) > 0:
+            lane_ids_u = lane_idcs[graph['left']['u']]
+            lane_ids_v = lane_idcs[graph['left']['v']]
+            left[ lane_ids_u, lane_ids_v ] = 1
+        if len(graph['right']['u']) > 0:
+            lane_ids_u = lane_idcs[graph['right']['u']]
+            lane_ids_v = lane_idcs[graph['right']['v']]
+            right[ lane_ids_u, lane_ids_v ] = 1
 
     node_rel = dict()
     for k1 in ["pre", "suc"]:
@@ -734,21 +752,34 @@ def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
     vel_per_agent, _ = get_velocity_per_agent(agent_feats)
     sub_graph_per_agent = []
     valid_agent_ids = []
-    # subg_feat_dim = 8 + obs_steps * 4
+    
     for agent_idx in range(num_agents):
         if vel_per_agent[agent_idx] == 0: 
             continue
         
-        ## begin to file a sub_graph_per_agent
-
-        # get search horizon
+        ## get search horizon
         suc_horizon = vel_per_agent[agent_idx] * 3.0 + horizon_buffer # (3.0s trajectory + 20m)
         pre_horizon = vel_per_agent[agent_idx] * 2.0 + horizon_buffer # (2.0s trajectory + 20m)
-        # pre_horizon = lon_dist_per_agent[agent_idx] + horizon_buffer # (2.0s trajectory + 20m)
+        
         # find ctr node closest to agent_ctr and coresp. lane id
-        node_id        = match_node_id_per_agent[agent_idx]
-        target_lane_id = lane_idcs[node_id]
+        cur_agt_dir = agent_feats[agent_idx, -1, :2]
+        sorted_node_idcs_ = sorted_nodes_idcs[:, agent_idx]
+        sorted_node_dirs  = graph['feats'][sorted_node_idcs_]
+        t1 = np.arctan2(cur_agt_dir[1], cur_agt_dir[0])
+        t2 = np.arctan2(sorted_node_dirs[:, 1], sorted_node_dirs[:, 0])
+        dt = np.abs(t1 - t2)
+        mask = dt > np.pi
+        dt[mask] = np.abs(dt[mask] - 2 * np.pi)
+        mask = dt < 0.25 * np.pi
+        if len(sorted_node_idcs_[mask]) == 0:
+            mask = dt < 0.5 * np.pi
+            if len(sorted_node_idcs_[mask]) == 0:
+                continue
+        node_id = sorted_node_idcs_[mask][0]
+        
+
         # find pre and suc lanes
+        target_lane_id = lane_idcs[node_id]
         searched_lane_ids = [target_lane_id]
         searched_lane_ids.extend( get_lanes_with_dfs(suc, target_lane_id, lane_idcs, graph['feats'], suc_horizon) )
         searched_lane_ids.extend( get_lanes_with_dfs(pre, target_lane_id, lane_idcs, graph['feats'], pre_horizon) )
@@ -761,8 +792,7 @@ def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
         if len(node_mask) < 6: # ignore this agent who has too less nodes
             continue
         
-        ## extract map node feature from global graph [node', 8 + 20*4]
-        # sub_graph_feats = np.zeros((len(node_mask), subg_feat_dim), dtype=np.float32)
+        ## extract map node feature from global graph
         sub_graph_feats = np.zeros((len(node_mask), 8), dtype=np.float32)
         sub_graph_feats[:, :2]  = graph['ctrs'][node_mask]  # [node', 2]
         sub_graph_feats[:, 2:4] = graph['feats'][node_mask] # [node', 2]
@@ -775,142 +805,18 @@ def process_lane_roi(data, horizon_buffer = 20., max_vel_threshold = 2.78):
             data['feats'][agent_idx, :, :2],
         ], axis=-1) # [20, 4]
         interest_node_idcs = closed_node_ids[closed_agent_ids==agent_idx]
-        # for i, nid in enumerate(node_mask):
-        #     if nid in interest_node_idcs:
-        #         sub_graph_feats[i, 8:] = motion_feat.reshape(-1) # [20 * 4]
+
         # get index of sub graph (node_mask store index of global graph)
         associated_node_idcs = [i for i, nid in enumerate(node_mask) if nid in interest_node_idcs ]
-        # sub_graph['associated_node_idcs'] = np.array(associated_node_idcs)
+
         vs = np.array(associated_node_idcs, dtype=np.int32)
         us = np.zeros(len(vs), dtype=np.int32)
-        sub_graph['a2m'] = {'u': us, 'v': vs}
-
+        sub_graph['a2m']        = {'u': us, 'v': vs}
         sub_graph['node_mask']  = node_mask
         sub_graph['num_nodes']  = len(node_mask)
         sub_graph['feats']      = sub_graph_feats
         sub_graph['agent_feat'] = motion_feat.reshape(-1) # [20 * 4]
-        
-        for k1 in ["pre", "suc"]:
-            sub_graph[k1] = []
-            for ig in range(6):
-                temp   = node_rel[k1][ig] # relation matrix
-                us, vs = np.nonzero(temp[node_mask][:, node_mask])
-                assert isinstance(us, np.ndarray) and isinstance(vs, np.ndarray)
-                sub_graph[k1].append({'u': us, 'v': vs})
-        
-        ## ignore this agent if pre/suc_0 is empty
-        if len(sub_graph["pre"][0]["u"]) == 0 and len(sub_graph["suc"][0]["u"]) == 0:
-            continue
-        
-        for k1 in ["left", "right"]:
-            temp   = node_rel[k1] # relation matrix
-            us, vs = np.nonzero(temp[node_mask][:, node_mask])
-            assert isinstance(us, np.ndarray) and isinstance(vs, np.ndarray)
-            sub_graph[k1] = {'u': us, 'v': vs}
-        
-        sub_graph_per_agent.append(sub_graph)
-        valid_agent_ids.append(agent_idx)
-    
-    data["subgraphs"]       = sub_graph_per_agent
-    data["valid_agent_ids"] = np.asarray(valid_agent_ids, np.int16)
-    return data
-
-
-# AGs: agents, GNs: graph nodes
-# max_vel_threshold: 10 kph / 3.6 = 2.78 m/s
-def process_lane_roi_backup(data, horizon_buffer = 20., max_vel_threshold = 2.78):
-    obs_steps   = data['feats'].shape[1] # 20
-    agent_feats = data['feats']     # [AGs, seq=20, feat=3]
-    agent_ctrs  = data['ctrs']      # [AGs, 2]
-    gt_preds    = data['gt_preds']  # [AGs, 30, 2]
-    has_preds   = data['has_preds'] # [AGs, 30]
-    graph       = data['graph']
-    lane_idcs   = graph['lane_idcs'] # [GNs,]
-    num_lanes   = lane_idcs[-1] + 1
-    num_nodes   = len(lane_idcs)
-    num_agents  = len(agent_ctrs)
-
-    ## get distance between map node and agent, shape=[Gs, AGs, 2]
-    dist = np.expand_dims(graph['ctrs'], axis=1) - np.expand_dims(agent_ctrs, axis=0)
-    dist = np.sqrt((dist**2).sum(-1))
-    match_node_id_per_agent = dist.argmin(axis=0) # matched graph node id per agent
-    ## get interest nodes(<= 5.0) per agent
-    closed_node_ids, closed_agent_ids = np.nonzero(dist < 5.0)
-    assert len(gt_preds) == num_agents
-
-    if True:
-        pre   = np.zeros((num_lanes, num_lanes), dtype=np.bool_)
-        suc   = np.zeros((num_lanes, num_lanes), dtype=np.bool_)
-        left  = np.zeros((num_lanes, num_lanes), dtype=np.bool_)
-        right = np.zeros((num_lanes, num_lanes), dtype=np.bool_)
-        if len(graph['pre_pairs']) > 0:
-            pre[ graph['pre_pairs'][:, 0], graph['pre_pairs'][:, 1] ] = 1
-        if len(graph['suc_pairs']) > 0:
-            suc[ graph['suc_pairs'][:, 0], graph['suc_pairs'][:, 1] ] = 1
-        if len(graph['left_pairs']) > 0:
-            left[ graph['left_pairs'][:, 0], graph['left_pairs'][:, 1] ] = 1
-        if len(graph['right_pairs']) > 0:
-            right[ graph['right_pairs'][:, 0], graph['right_pairs'][:, 1] ] = 1
-
-    node_rel = dict()
-    for k1 in ["pre", "suc"]:
-        node_rel[k1] = []
-        for ig in range(6):
-            temp = np.zeros((num_nodes, num_nodes), np.bool_)
-            temp[graph[k1][ig]['u'], graph[k1][ig]['v']] = 1
-            node_rel[k1].append(temp) 
-    for k1 in ["left", "right"]:
-        temp = np.zeros((num_nodes, num_nodes), np.bool_)
-        temp[graph[k1]['u'], graph[k1]['v']] = 1
-        node_rel[k1] = temp
-    
-    vel_per_agent = get_velocity_per_agent(agent_feats)
-    sub_graph_per_agent = []
-    valid_agent_ids = []
-    subg_feat_dim = 8 + obs_steps * 4
-    for agent_idx in range(num_agents):
-        if vel_per_agent[agent_idx] == 0:
-            continue
-        
-        # get search horizon
-        suc_horizon = vel_per_agent[agent_idx] * 3.0 + horizon_buffer # (3.0s trajectory + 20m)
-        pre_horizon = vel_per_agent[agent_idx] * 2.0 + horizon_buffer # (2.0s trajectory + 20m)
-        # find ctr node closest to agent_ctr and coresp. lane id
-        node_id        = match_node_id_per_agent[agent_idx]
-        target_lane_id = lane_idcs[node_id]
-        # find pre and suc lanes
-        searched_lane_ids = [target_lane_id]
-        searched_lane_ids.extend( get_lanes_with_dfs(suc, target_lane_id, lane_idcs, graph['feats'], suc_horizon) )
-        searched_lane_ids.extend( get_lanes_with_dfs(pre, target_lane_id, lane_idcs, graph['feats'], pre_horizon) )
-        roi_lane_idcs = get_nbr_set(left + right, searched_lane_ids) # find left and right lanes
-
-        # create lane roi for each agent:
-        sub_graph  = dict()
-        node_mask  = np.concatenate([ np.nonzero(lane_idcs == x)[0]
-            for x in roi_lane_idcs ])
-        if len(node_mask) < 6: # ignore this agent who has too less nodes
-            continue
-        
-        ## extract map node feature from global graph [node', 8 + 20*4]
-        sub_graph_feats = np.zeros((len(node_mask), subg_feat_dim), dtype=np.float32)
-        sub_graph_feats[:, :2]  = graph['ctrs'][node_mask]  # [node', 2]
-        sub_graph_feats[:, 2:4] = graph['feats'][node_mask] # [node', 2]
-        sub_graph_feats[:, 4:6] = graph['turn'][node_mask]  # [node', 2]
-        sub_graph_feats[:, 6]   = graph['control'][node_mask]
-        sub_graph_feats[:, 7]   = graph['intersect'][node_mask]
-
-        motion_feat = np.concatenate([
-            data['obs_trajs'][agent_idx, :, :2],
-            data['feats'][agent_idx, :, :2],
-        ], axis=-1) # [20, 4]
-        interest_node_idcs = closed_node_ids[closed_agent_ids==agent_idx]
-        for i, nid in enumerate(node_mask):
-            if nid in interest_node_idcs:
-                sub_graph_feats[i, 8:] = motion_feat.reshape(-1) # [20 * 4]
-
-        sub_graph['node_mask'] = node_mask
-        sub_graph['num_nodes'] = len(node_mask)
-        sub_graph['feats']     = sub_graph_feats
+        sub_graph['agent_vel']  = vel_per_agent[agent_idx]
 
         for k1 in ["pre", "suc"]:
             sub_graph[k1] = []
@@ -936,4 +842,3 @@ def process_lane_roi_backup(data, horizon_buffer = 20., max_vel_threshold = 2.78
     data["subgraphs"]       = sub_graph_per_agent
     data["valid_agent_ids"] = np.asarray(valid_agent_ids, np.int16)
     return data
-
