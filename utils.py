@@ -109,6 +109,9 @@ class Optimizer(object):
             )
         elif opt == "adam":
             self.opt = optim.Adam(param_groups, weight_decay=0)
+        elif opt == "adamw":
+            weight_decay = config.get("weight_decay", 0.01)
+            self.opt = optim.AdamW(param_groups, weight_decay=weight_decay)
 
         self.lr_func = config["lr_func"]
 
