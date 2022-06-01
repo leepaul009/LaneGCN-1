@@ -1,10 +1,13 @@
+# Copyright (c) 2020 Uber Technologies, Inc.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 
 os.umask(0)
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
+# os.environ["MKL_NUM_THREADS"] = "1"
+# os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# os.environ["OMP_NUM_THREADS"] = "1"
 import argparse
 import numpy as np
 import random
@@ -19,9 +22,15 @@ import torch
 from torch.utils.data import Sampler, DataLoader
 import horovod.torch as hvd
 
+torch.set_num_threads(6)
+
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 from torch.utils.data.distributed import DistributedSampler
 
 from utils import Logger, load_pretrain
+from utils import gpu, to_long,  Optimizer, StepLR
 
 from mpi4py import MPI
 
@@ -37,6 +46,7 @@ sys.path.insert(0, root_path)
 parser = argparse.ArgumentParser(description="Fuse Detection in Pytorch")
 parser.add_argument("-m", "--model", default="lanercnn", type=str, metavar="MODEL", help="model name")
 parser.add_argument("--eval", action="store_true")
+parser.add_argument("--debug", action="store_true", help="turn on this mode will let you print loss very step to debug script")
 parser.add_argument("--resume", default="", type=str, metavar="RESUME", help="checkpoint path")
 parser.add_argument("--weight", default="", type=str, metavar="WEIGHT", help="checkpoint path")
 
@@ -93,16 +103,16 @@ def main():
   )
 
   val_loader = None
-  dataset = Dataset(config["val_split"], config, train=False)
-  val_sampler = DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())
-  val_loader = DataLoader(
-    dataset,
-    batch_size=config["val_batch_size"],
-    num_workers=config["val_workers"],
-    sampler=val_sampler,
-    collate_fn=collate_fn,
-    pin_memory=True,
-  )
+  # dataset = Dataset(config["val_split"], config, train=False)
+  # val_sampler = DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())
+  # val_loader = DataLoader(
+  #   dataset,
+  #   batch_size=config["val_batch_size"],
+  #   num_workers=config["val_workers"],
+  #   sampler=val_sampler,
+  #   collate_fn=collate_fn,
+  #   pin_memory=True,
+  # )
   
 
   hvd.broadcast_parameters(net.state_dict(), root_rank=0)
@@ -113,7 +123,7 @@ def main():
   print("remaining_epochs = {} ".format(remaining_epochs))
   for i in range(remaining_epochs):
     train(epoch + i, config, train_loader, 
-      net, loss, post_process, opt, val_loader)
+      net, loss, post_process, opt, val_loader, debug=args.debug)
 
 def worker_init_fn(pid):
     np_seed = hvd.rank() * 1024 + int(pid)
@@ -121,7 +131,7 @@ def worker_init_fn(pid):
     random_seed = np.random.randint(2 ** 32 - 1)
     random.seed(random_seed)
 
-def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=None):
+def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=None, debug=False):
   train_loader.sampler.set_epoch(int(epoch))
   net.train()
 
@@ -155,9 +165,9 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
       loss_out["loss"].backward()
       lr = opt.step(epoch)
 
-      if i % 100 == 0:
-        print("loss: {}".format( 
-          loss_out["loss"].detach().cpu().item() ))
+      # if i % 100 == 0:
+      #   print("loss: {}".format( 
+      #     loss_out["loss"].detach().cpu().item() ))
 
       num_iters = int(np.round(epoch * num_batches))
       if hvd.rank() == 0 and (
@@ -166,7 +176,7 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
           save_ckpt(net, opt, config["save_dir"], epoch)
 
       # if num_iters % display_iters == 0:
-      if i % 100 == 0:
+      if i % 100 == 0 or debug:
           dt = time.time() - start_time
           metrics = sync(metrics)
           if hvd.rank() == 0:
@@ -174,14 +184,15 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
           start_time = time.time()
           metrics = dict()
       
-      if i % 1000 == 0:
-        val(config, val_loader, net, loss, post_process, epoch)
+      # if i % 1000 == 0:
+      #     val(config, val_loader, net, loss, post_process, epoch)
       # if num_iters % val_iters == 0:
       #     val(config, val_loader, net, loss, post_process, epoch)
 
       # if epoch >= config["num_epochs"]:
       #     val(config, val_loader, net, loss, post_process, epoch)
       #     return
+
 
 def val(config, data_loader, net, loss, post_process, epoch):
   net.eval()
