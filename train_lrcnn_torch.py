@@ -2,6 +2,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib.metadata import distribution
 import os
 
 os.umask(0)
@@ -28,7 +29,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 
-from utils import Logger, load_pretrain
+from utils import Logger, load_pretrain, load_pretrain_dist
 from utils import gpu, to_long,  Optimizer, StepLR
 
 from mpi4py import MPI
@@ -72,16 +73,6 @@ def main():
 
   model = import_module(args.model)
   config, Dataset, collate_fn, net, loss, post_process = model.get_model_for_torch_dist()
-
-  # if args.resume or args.weight:
-  #   ckpt_path = args.resume or args.weight
-  #   if not os.path.isabs(ckpt_path):
-  #     ckpt_path = os.path.join(config["save_dir"], ckpt_path)
-  #   ckpt = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
-  #   load_pretrain(net, ckpt["state_dict"])
-  #   if args.resume:
-  #     config["epoch"] = ckpt["epoch"]
-  #     opt.load_state_dict(ckpt["opt_state"])
 
   save_dir = config["save_dir"]
   log = os.path.join(save_dir, "log")
@@ -133,6 +124,17 @@ def main():
   
   opt = Optimizer(net.parameters(), config)
   
+  if args.resume or args.weight:
+    ckpt_path = args.resume or args.weight
+    if not os.path.isabs(ckpt_path):
+      ckpt_path = os.path.join(config["save_dir"], ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+    # load_pretrain(net, ckpt["state_dict"])
+    load_pretrain_dist(net, distributed, ckpt["state_dict"])
+    if args.resume:
+      config["epoch"] = ckpt["epoch"]
+      opt.load_state_dict(ckpt["opt_state"])
+
   epoch = config["epoch"]
   remaining_epochs = int(np.ceil(config["num_epochs"] - epoch))
   print("remaining_epochs = {} ".format(remaining_epochs))
@@ -247,7 +249,7 @@ def save_ckpt(net, opt, save_dir, epoch):
   if not os.path.exists(save_dir):
     os.makedirs(save_dir)
   
-  state_dict = net.state_dict()
+  state_dict = net.module.state_dict() # for distributed
   for key in state_dict.keys():
     state_dict[key] = state_dict[key].cpu()
 
