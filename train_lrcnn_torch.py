@@ -47,6 +47,7 @@ sys.path.insert(0, root_path)
 
 parser = argparse.ArgumentParser(description="Fuse Detection in Pytorch")
 parser.add_argument("-m", "--model", default="lanercnn", type=str, metavar="MODEL", help="model name")
+parser.add_argument("--gpus", default=4, type=int, help="total number of GPUs")
 parser.add_argument("--eval", action="store_true")
 parser.add_argument("--resume", default="", type=str, metavar="RESUME", help="checkpoint path")
 parser.add_argument("--weight", default="", type=str, metavar="WEIGHT", help="checkpoint path")
@@ -61,7 +62,7 @@ def main():
       device = torch.device('cuda:{}'.format(args.local_rank))
       torch.cuda.set_device(args.local_rank)
       torch.distributed.init_process_group(
-          backend="nccl", init_method="env://", rank=args.local_rank, world_size=4)
+          backend="nccl", init_method="env://", rank=args.local_rank, world_size=args.gpus)
   else:
       device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
