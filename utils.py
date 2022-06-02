@@ -58,6 +58,18 @@ def load_pretrain(net, pretrain_dict):
             state_dict[key] = value
     net.load_state_dict(state_dict)
 
+def load_pretrain_dist(net, distributed, pretrain_dict):
+    state_dict = net.state_dict()
+    for key in pretrain_dict.keys():
+        if key in state_dict and (pretrain_dict[key].size() == state_dict[key].size()):
+            value = pretrain_dict[key]
+            if not isinstance(value, torch.Tensor):
+                value = value.data
+            state_dict[key] = value
+    if distributed:
+        net.module.load_state_dict(state_dict)
+    else:
+        net.load_state_dict(state_dict)
 
 def gpu(data):
     """
@@ -102,7 +114,7 @@ class Optimizer(object):
             param_groups.append({"params": param, "lr": 0})
 
         opt = config["opt"]
-        assert opt == "sgd" or opt == "adam"
+        assert opt == "sgd" or opt == "adam" or opt == "adamw"
         if opt == "sgd":
             self.opt = optim.SGD(
                 param_groups, momentum=config["momentum"], weight_decay=config["wd"]
