@@ -158,7 +158,7 @@ class ArgoDataset(Dataset):
             [np.cos(theta), -np.sin(theta)],
             [np.sin(theta), np.cos(theta)]], np.float32)
 
-        feats, ctrs, gt_preds, has_preds = [], [], [], []
+        feats, ctrs, gt_preds, has_preds, obs_trajs = [], [], [], [], []
         for traj, step in zip(data['trajs'], data['steps']):
             if 19 not in step:
                 continue
@@ -191,7 +191,8 @@ class ArgoDataset(Dataset):
             x_min, x_max, y_min, y_max = self.config['pred_range']
             if feat[-1, 0] < x_min or feat[-1, 0] > x_max or feat[-1, 1] < y_min or feat[-1, 1] > y_max:
                 continue
-
+            
+            obs_trajs.append( copy.deepcopy(feat) )
             ctrs.append(feat[-1, :2].copy())
             feat[1:, :2] -= feat[:-1, :2]
             feat[step[0], :2] = 0
@@ -203,8 +204,10 @@ class ArgoDataset(Dataset):
         ctrs = np.asarray(ctrs, np.float32)
         gt_preds = np.asarray(gt_preds, np.float32)
         has_preds = np.asarray(has_preds, np.bool)
+        obs_trajs = np.asarray(obs_trajs, np.float32)
 
         data['feats'] = feats
+        data['obs_trajs'] = obs_trajs
         data['ctrs'] = ctrs
         data['orig'] = orig
         data['theta'] = theta
